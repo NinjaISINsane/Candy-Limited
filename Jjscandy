@@ -1,0 +1,1026 @@
+-- ============================================================
+-- Auto Candy Farm v7.2
+-- Modes: Smart | Walk | Tween | Hop | Instant
+-- * Wall-safe routing: every leg is checked for walls AND floor
+-- * Rubber-band detection: auto-slows, falls back to Walk if it keeps happening
+-- * Clipping only as a last resort (toggle in Config)
+-- * Home: set a spot, retreats there ONLY when no candy is left
+-- ============================================================
+
+local Players            = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local TweenService       = game:GetService("TweenService")
+
+-- ------------------------------------------------------------
+-- PLAYER BINDING
+-- ------------------------------------------------------------
+local player = Players.LocalPlayer
+local character, hrp, humanoid
+
+local function bind(c)
+    character = c
+    hrp       = c:WaitForChild("HumanoidRootPart")
+    humanoid  = c:WaitForChild("Humanoid")
+end
+bind(player.Character or player.CharacterAdded:Wait())
+player.CharacterAdded:Connect(bind)
+
+-- ------------------------------------------------------------
+-- CONFIG & STATE
+-- ------------------------------------------------------------
+local CONFIG = {
+    mode            = "Smart",
+    speed           = 120,
+    actionText      = "Open",
+    clickBurst      = 3,
+    hopHeight       = 120,
+    verify          = true,    -- confirm the door opened, retry if not
+    autoSlow        = true,    -- slow down after a rubber-band
+    allowClip       = true,    -- clip/hop ONLY when no clean route exists
+    returnHome      = true,    -- go home when no candy is left
+    retries         = 2,
+    cooldownRadius  = 12,
+    cooldownSuccess = 3,
+    cooldownFail    = 6,
+    pathTimeout     = 15,
+    waypointTimeout = 5,
+}
+
+local state = { running = false, manual = false, busy = false, alive = true }
+local cooldowns, conns = {}, {}
+local home
+local throttle, rubberStreak = 1, 0
+local emptySince
+
+local setStatus, onHomeChanged, onThrottle -- assigned in GUI section
+
+local function active() return state.running or state.manual end
+local function now() return os.clock() end
+local function effSpeed() return math.max(CONFIG.speed * (CONFIG.autoSlow and throttle or 1), 1) end
+
+-- ------------------------------------------------------------
+-- HELPERS
+-- ------------------------------------------------------------
+local function isHidden(pos)
+    return math.abs(pos.X) > 1e5 or math.abs(pos.Y) > 1e5 or math.abs(pos.Z) > 1e5
+end
+
+local function basePart(obj)
+    while obj and not obj:IsA("BasePart") do obj = obj.Parent end
+    return obj
+end
+
+local function hover() return humanoid.HipHeight + hrp.Size.Y / 2 end
+
+local function cool(pos, duration)
+    cooldowns[pos] = { t = now() + duration, r = CONFIG.cooldownRadius }
+end
+
+local function isCooling(pos)
+    for p, c in pairs(cooldowns) do
+        if c.t < now() then
+            cooldowns[p] = nil
+        elseif (p - pos).Magnitude <= c.r then
+            return true
+        end
+    end
+    return false
+end
+
+-- ------------------------------------------------------------
+-- PROMPT REGISTRY (event driven)
+-- ------------------------------------------------------------
+local registry = {}
+local function track(o) if o:IsA("ProximityPrompt") then registry[o] = true end end
+for _, o in ipairs(workspace:GetDescendants()) do track(o) end
+conns[#conns + 1] = workspace.DescendantAdded:Connect(track)
+conns[#conns + 1] = workspace.DescendantRemoving:Connect(function(o) registry[o] = nil end)
+
+local function scan()
+    local want, out = CONFIG.actionText:lower(), {}
+    for prompt in pairs(registry) do
+        if prompt.Enabled and prompt.ActionText:lower() == want then
+            local part = basePart(prompt.Parent)
+            if part and part:IsDescendantOf(workspace) and not isHidden(part.Position) then
+                out[#out + 1] = { prompt = prompt, part = part, pos = part.Position }
+            end
+        end
+    end
+    return out
+end
+
+-- ------------------------------------------------------------
+-- NOCLIP (only used by the last-resort Hop)
+-- ------------------------------------------------------------
+local noclipConn
+local function setNoclip(on)
+    if on and not noclipConn then
+        noclipConn = RunService.Stepped:Connect(function()
+            if not character then return end
+            for _, p in ipairs(character:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end)
+    elseif not on and noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
+    end
+end
+
+-- ------------------------------------------------------------
+-- WORLD QUERIES
+-- ------------------------------------------------------------
+local function rayParams(ignore)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.RespectCanCollide = true
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then list[#list + 1] = p.Character end
+    end
+    if ignore then list[#list + 1] = ignore end
+    rp.FilterDescendantsInstances = list
+    return rp
+end
+
+local function rayClear(a, b, ignore)
+    local d = b - a
+    if d.Magnitude < 0.1 then return true end
+    return workspace:Raycast(a, d, rayParams(ignore)) == nil
+end
+
+-- body-width clearance: no walls between a and b
+local function bodyClear(a, b)
+    local d = b - a
+    if d.Magnitude < 0.1 then return true end
+    local ok, hit = pcall(function() return workspace:Spherecast(a, 1.5, d, rayParams()) end)
+    if not ok then return rayClear(a, b) end
+    return hit == nil
+end
+
+-- floor exists along the whole leg (no flying off ledges / over voids)
+local function groundedLine(a, b)
+    local len   = (b - a).Magnitude
+    local steps = math.clamp(math.ceil(len / 6), 1, 60)
+    local rp    = rayParams()
+    local reach = hover() + 6
+    for i = 0, steps do
+        local p = a:Lerp(b, i / steps)
+        if not workspace:Raycast(p, Vector3.new(0, -reach, 0), rp) then return false end
+    end
+    return true
+end
+
+local function legSafe(a, b) return bodyClear(a, b) and groundedLine(a, b) end
+
+-- ------------------------------------------------------------
+-- APPROACH POINTS (stand OUTSIDE, in front of the door)
+-- ------------------------------------------------------------
+local function approachPoints(t)
+    local part  = t.part
+    local stand = math.clamp((t.prompt.MaxActivationDistance or 10) * 0.5, 2.5, 5)
+    local cf    = part.CFrame
+    local flat  = function(v) return Vector3.new(v.X, 0, v.Z) end
+
+    local dirs = { cf.LookVector, -cf.LookVector, cf.RightVector, -cf.RightVector, hrp.Position - t.pos }
+    local list, rp = {}, rayParams(part)
+
+    for _, d in ipairs(dirs) do
+        d = flat(d)
+        if d.Magnitude > 0.2 then
+            local p = t.pos + d.Unit * stand
+            local hit = workspace:Raycast(Vector3.new(p.X, t.pos.Y + 2, p.Z), Vector3.new(0, -30, 0), rp)
+            p = hit and Vector3.new(p.X, hit.Position.Y + hover(), p.Z) or Vector3.new(p.X, t.pos.Y, p.Z)
+
+            if rayClear(p, t.pos, part) then
+                local roofed = workspace:Raycast(p, Vector3.new(0, 40, 0), rp) ~= nil
+                list[#list + 1] = { pos = p, score = (p - hrp.Position).Magnitude + (roofed and 20 or 0) }
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return a.score < b.score end)
+    if #list == 0 then
+        local d = flat(hrp.Position - t.pos)
+        d = d.Magnitude > 0.2 and d.Unit or Vector3.new(0, 0, 1)
+        list[1] = { pos = t.pos + d * stand, score = 0 }
+    end
+    return list
+end
+
+-- ------------------------------------------------------------
+-- MOVEMENT PRIMITIVES
+-- ------------------------------------------------------------
+local RUBBER_DIST = 12
+
+-- returns ok, reason ("stopped" | "rubber")
+local function fly(points)
+    local segLen, total = {}, 0
+    for i = 2, #points do
+        segLen[i] = (points[i] - points[i - 1]).Magnitude
+        total += segLen[i]
+    end
+    if total < 0.1 then return true end
+
+    local expected  = hrp.Position
+    local travelled = 0
+    local startT    = now()
+
+    while travelled < total do
+        if not active() or not hrp or not hrp.Parent then return false, "stopped" end
+        local dt = RunService.Heartbeat:Wait()
+        if not hrp.Parent then return false, "stopped" end
+
+        -- server yanked us back? stop immediately and re-plan from here
+        if (hrp.Position - expected).Magnitude > RUBBER_DIST then return false, "rubber" end
+
+        local spd  = effSpeed()
+        local ramp = math.clamp((now() - startT) / 0.3, 0.25, 1)
+        local ease = math.clamp((total - travelled) / math.max(spd * 0.25, 1), 0.25, 1)
+        travelled  = math.min(total, travelled + spd * math.min(ramp, ease) * dt)
+
+        local remain, pos = travelled, points[#points]
+        for i = 2, #points do
+            if remain <= segLen[i] then
+                pos = points[i - 1]:Lerp(points[i], segLen[i] > 0 and remain / segLen[i] or 1)
+                break
+            end
+            remain -= segLen[i]
+        end
+
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)
+        expected = pos
+    end
+    return true
+end
+
+-- last resort: lowest altitude where up / across / down are clear (clips)
+local function hop(goal)
+    setNoclip(true)
+    local start = hrp.Position
+    local base  = math.max(start.Y, goal.Y)
+    local pts
+    for _, extra in ipairs({ 0, 12, 30, 60, 100 }) do
+        local y = base + extra
+        local a = Vector3.new(start.X, y, start.Z)
+        local b = Vector3.new(goal.X,  y, goal.Z)
+        if bodyClear(start, a) and bodyClear(a, b) and bodyClear(b, goal) then
+            pts = { start, a, b, goal }
+            break
+        end
+    end
+    if not pts then
+        local y = base + CONFIG.hopHeight
+        pts = { start, Vector3.new(start.X, y, start.Z), Vector3.new(goal.X, y, goal.Z), goal }
+    end
+    local ok, reason = fly(pts)
+    setNoclip(false)
+    return ok, reason
+end
+
+-- ------------------------------------------------------------
+-- PATHFINDING
+-- ------------------------------------------------------------
+local PROFILES = {
+    { AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false },
+    { AgentRadius = 1, AgentHeight = 3, AgentCanJump = true, AgentCanClimb = true  },
+}
+
+local function computePath(from, to)
+    for _, prof in ipairs(PROFILES) do
+        local params = table.clone(prof)
+        params.WaypointSpacing = math.max(4, math.min(20, effSpeed() / 12))
+        local path = PathfindingService:CreatePath(params)
+        local ok = pcall(path.ComputeAsync, path, from, to)
+        if ok and path.Status == Enum.PathStatus.Success then
+            return path, path:GetWaypoints()
+        end
+    end
+end
+
+local function pathPoints(wps)
+    local pts, h = { hrp.Position }, Vector3.new(0, hover(), 0)
+    for i = 2, #wps do pts[#pts + 1] = wps[i].Position + h end
+    return pts
+end
+
+-- cut corners only where the shortcut is provably wall-free and has floor
+local function simplify(pts)
+    local out, i = { pts[1] }, 1
+    while i < #pts do
+        local j = math.min(#pts, i + 8)
+        while j > i + 1 and not legSafe(pts[i], pts[j]) do j -= 1 end
+        out[#out + 1] = pts[j]
+        i = j
+    end
+    return out
+end
+
+local function pathLength(wps)
+    local len = 0
+    for i = 2, #wps do len += (wps[i].Position - wps[i - 1].Position).Magnitude end
+    return len
+end
+
+-- returns ok, reason
+local function walk(path, wps)
+    local oldSpeed = humanoid.WalkSpeed
+    humanoid.WalkSpeed = math.clamp(CONFIG.speed, 16, 400)
+
+    local blockedIdx
+    local conn = path.Blocked:Connect(function(i) blockedIdx = i end)
+    local function finish(ok, reason)
+        conn:Disconnect()
+        if humanoid and humanoid.Parent then humanoid.WalkSpeed = oldSpeed end
+        return ok, reason
+    end
+
+    local budget = math.max(CONFIG.pathTimeout, pathLength(wps) / math.max(CONFIG.speed, 16) * 2 + 4)
+    local t0 = now()
+
+    for i = 2, #wps do
+        local wp  = wps[i]
+        local tol = (i == #wps) and 2.5 or 5
+        if wp.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+        humanoid:MoveTo(wp.Position)
+
+        local wpStart, lastPos, lastChk, stuck = now(), hrp.Position, now(), 0
+        while true do
+            if not active() or not hrp.Parent then return finish(false, "stopped") end
+            if now() - t0 > budget then return finish(false, "timeout") end
+            if blockedIdx and blockedIdx >= i then return finish(false, "blocked") end
+
+            local d = hrp.Position - wp.Position
+            if Vector3.new(d.X, d.Y * 0.35, d.Z).Magnitude <= tol then break end
+
+            local nxt = wps[i + 1]
+            if nxt and d.Magnitude < 10
+               and (hrp.Position - nxt.Position).Magnitude < (wp.Position - nxt.Position).Magnitude - 1 then
+                break
+            end
+
+            if now() - lastChk >= 0.5 then
+                if (hrp.Position - lastPos).Magnitude < 1 then
+                    stuck += 1
+                    humanoid.Jump = true
+                    humanoid:MoveTo(wp.Position)
+                    if stuck >= 3 then return finish(false, "stuck") end
+                else
+                    stuck = 0
+                end
+                lastPos, lastChk = hrp.Position, now()
+            end
+
+            if now() - wpStart > CONFIG.waypointTimeout then break end
+            task.wait(0.03)
+        end
+    end
+    return finish(true)
+end
+
+-- ------------------------------------------------------------
+-- TRAVEL (shared by candy runs and going home)
+-- ------------------------------------------------------------
+local function moveInner(cands)
+    local mode = CONFIG.mode
+    if rubberStreak >= 3 and mode ~= "Instant" then mode = "Walk" end -- keeps getting reset: walk for real
+
+    if mode == "Instant" then
+        hrp.CFrame = CFrame.new(cands[1].pos)
+        return true
+    end
+    if mode == "Hop" then return hop(cands[1].pos) end
+
+    local lastReason = "nopath"
+    for i = 1, math.min(3, #cands) do
+        local c = cands[i].pos
+
+        -- 1) direct line, only if wall-free and has floor the whole way
+        if mode == "Smart" and legSafe(hrp.Position, c) then
+            return fly({ hrp.Position, c })
+        end
+
+        -- 2) real navmesh route
+        for _ = 1, CONFIG.retries + 1 do
+            if not active() then return false, "stopped" end
+            local path, wps = computePath(hrp.Position, c)
+            if not path then break end
+
+            if mode == "Walk" then
+                local ok, reason = walk(path, wps)
+                if ok then return true end
+                if reason == "stopped" then return false, "stopped" end
+                lastReason = reason
+                setStatus("Re-pathing", nil, reason)
+            else
+                return fly(simplify(pathPoints(wps)))
+            end
+        end
+    end
+
+    -- 3) last resort: clip over it
+    if CONFIG.allowClip then return hop(cands[1].pos) end
+    return false, lastReason
+end
+
+local function moveTo(cands)
+    local pok, ok, reason = pcall(moveInner, cands)
+    setNoclip(false)
+    if not pok then return false, "error" end
+
+    if ok then
+        rubberStreak = 0
+        throttle = math.min(1, throttle + 0.08)
+    elseif reason == "rubber" then
+        rubberStreak += 1
+        if CONFIG.autoSlow then throttle = math.max(0.2, throttle * 0.55) end
+    end
+    if onThrottle then onThrottle() end
+    return ok, reason
+end
+
+-- ------------------------------------------------------------
+-- OPENING THE DOOR (verified, 3 methods)
+-- ------------------------------------------------------------
+local learn = { fires = 0, changes = 0 }
+
+local function isDone(prompt, action)
+    return not prompt.Parent
+        or not prompt:IsDescendantOf(workspace)
+        or not prompt.Enabled
+        or prompt.ActionText:lower() ~= action
+end
+
+local function inRange(t)
+    return (hrp.Position - t.pos).Magnitude <= math.max(t.prompt.MaxActivationDistance, 4) * 0.9
+end
+
+local function closeIn(t)
+    if inRange(t) then return end
+    local flat = Vector3.new(hrp.Position.X - t.pos.X, 0, hrp.Position.Z - t.pos.Z)
+    flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+    local goal = Vector3.new(t.pos.X, hrp.Position.Y, t.pos.Z) + flat * 2
+    if legSafe(hrp.Position, goal) then fly({ hrp.Position, goal }) end
+end
+
+local function face(pos)
+    local p = hrp.Position
+    hrp.CFrame = CFrame.lookAt(p, Vector3.new(pos.X, p.Y, pos.Z))
+end
+
+local function activate(t)
+    local prompt = t.prompt
+    local action = prompt.ActionText:lower()
+    local hold   = prompt.HoldDuration
+    pcall(function() prompt.HoldDuration = 0 end)
+
+    closeIn(t)
+    face(t.pos)
+    task.wait(0.05)
+
+    learn.fires += 1
+    local verify   = CONFIG.verify and not (learn.fires > 3 and learn.changes == 0)
+    local attempts = verify and 3 or 1
+
+    for attempt = 1, attempts do
+        if isDone(prompt, action) then break end
+        if attempt > 1 then setStatus(("Retrying open (%d/3)"):format(attempt), nil) end
+
+        if attempt == 1 then
+            for i = 1, CONFIG.clickBurst do
+                task.spawn(function() pcall(fireproximityprompt, prompt, 1) end)
+                if i < CONFIG.clickBurst then task.wait(0.02) end
+            end
+        elseif attempt == 2 then
+            pcall(function()
+                prompt:InputHoldBegin()
+                task.wait(0.15)
+                prompt:InputHoldEnd()
+            end)
+        else
+            pcall(function()
+                local vim = game:GetService("VirtualInputManager")
+                vim:SendKeyEvent(true,  prompt.KeyboardKeyCode, false, game)
+                task.wait(0.2)
+                vim:SendKeyEvent(false, prompt.KeyboardKeyCode, false, game)
+            end)
+        end
+
+        local t0 = now()
+        while verify and now() - t0 < 0.45 and not isDone(prompt, action) do task.wait(0.05) end
+    end
+
+    local done = isDone(prompt, action)
+    if done then learn.changes += 1 end
+    pcall(function() if prompt.Parent then prompt.HoldDuration = hold end end)
+
+    if not verify then return true end
+    return done
+end
+
+-- ------------------------------------------------------------
+-- GUI
+-- ------------------------------------------------------------
+local C = {
+    bg       = Color3.fromRGB(17, 17, 19),
+    surface  = Color3.fromRGB(26, 26, 29),
+    raised   = Color3.fromRGB(37, 37, 42),
+    line     = Color3.fromRGB(46, 46, 52),
+    text     = Color3.fromRGB(232, 232, 236),
+    muted    = Color3.fromRGB(124, 124, 134),
+    accent   = Color3.fromRGB(255, 138, 48),
+    onAccent = Color3.fromRGB(26, 15, 5),
+    good     = Color3.fromRGB(88, 206, 128),
+    warn     = Color3.fromRGB(238, 182, 78),
+    bad      = Color3.fromRGB(232, 86, 86),
+}
+
+local Inter = "rbxasset://fonts/families/Inter.json"
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function round(o, r) make("UICorner", { CornerRadius = UDim.new(0, r) }, o) return o end
+local function stroke(o, c) return make("UIStroke", { Color = c, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, o) end
+local function weight(o, w) pcall(function() o.FontFace = Font.new(Inter, w) end) end
+local function tw(o, props, t) TweenService:Create(o, TweenInfo.new(t or 0.15, Enum.EasingStyle.Quad), props):Play() end
+local function pad(o, l, t, r, b)
+    make("UIPadding", { PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t), PaddingRight = UDim.new(0, r), PaddingBottom = UDim.new(0, b) }, o)
+end
+
+local function label(parent, str, size, color, w, props)
+    props = props or {}
+    props.BackgroundTransparency = 1
+    props.Text, props.TextSize, props.TextColor3 = str, size, color or C.text
+    props.Font = props.mono and Enum.Font.RobotoMono or Enum.Font.GothamMedium
+    props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+    local mono = props.mono
+    props.mono = nil
+    local l = make("TextLabel", props, parent)
+    if not mono then weight(l, w or Enum.FontWeight.Medium) end
+    return l
+end
+
+local host
+do
+    local ok, h = pcall(function() return (gethui and gethui()) or game:GetService("CoreGui") end)
+    host = (ok and h) or player:WaitForChild("PlayerGui")
+end
+local old = host:FindFirstChild("SpookyFarm")
+if old then old:Destroy() end
+
+local gui = make("ScreenGui", { Name = "SpookyFarm", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 9999 }, host)
+local scale = make("UIScale", {}, gui)
+
+local W, H = 300, 448
+local function fitScale()
+    local vp = workspace.CurrentCamera.ViewportSize
+    scale.Scale = math.clamp(math.min((vp.X - 30) / W, (vp.Y - 40) / H), 0.55, 1.15)
+end
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fitScale)
+fitScale()
+
+local main = make("Frame", {
+    Size = UDim2.fromOffset(W, H), Position = UDim2.new(0.5, -W / 2, 0.5, -H / 2),
+    BackgroundColor3 = C.bg, BorderSizePixel = 0,
+}, gui)
+round(main, 8)
+stroke(main, C.line)
+
+local function hairline(parent, y)
+    return make("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.fromOffset(0, y), BackgroundColor3 = C.line, BorderSizePixel = 0 }, parent)
+end
+
+-- Header
+local header = make("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1 }, main)
+label(header, "Candy Farm", 14, C.text, Enum.FontWeight.SemiBold, { Size = UDim2.fromOffset(110, 44), Position = UDim2.fromOffset(16, 0) })
+label(header, "v7.2", 10, C.muted, nil, { Size = UDim2.fromOffset(40, 44), Position = UDim2.fromOffset(94, 1), mono = true })
+
+local function glyphBtn(txt, x)
+    local b = make("TextButton", {
+        Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, x, 0, 8), BackgroundTransparency = 1,
+        Text = txt, TextColor3 = C.muted, TextSize = 17, Font = Enum.Font.GothamMedium, BorderSizePixel = 0, AutoButtonColor = false,
+    }, header)
+    b.MouseEnter:Connect(function() tw(b, { TextColor3 = C.text }) end)
+    b.MouseLeave:Connect(function() tw(b, { TextColor3 = C.muted }) end)
+    return b
+end
+local hideBtn  = glyphBtn("–", -64)
+local closeBtn = glyphBtn("×", -36)
+hairline(main, 44)
+
+local mini = make("TextButton", {
+    Size = UDim2.fromOffset(40, 40), Position = UDim2.new(0, 14, 0.5, -20), BackgroundColor3 = C.bg,
+    Text = "CF", TextColor3 = C.accent, TextSize = 12, Font = Enum.Font.GothamBold, BorderSizePixel = 0, Visible = false,
+}, gui)
+round(mini, 8)
+stroke(mini, C.line)
+
+-- Tabs
+local tabStrip = make("Frame", { Size = UDim2.new(1, 0, 0, 34), Position = UDim2.fromOffset(0, 45), BackgroundTransparency = 1 }, main)
+local TAB_W = 58
+local tabUnderline = make("Frame", { Size = UDim2.fromOffset(TAB_W - 16, 2), Position = UDim2.fromOffset(24, 32), BackgroundColor3 = C.accent, BorderSizePixel = 0 }, tabStrip)
+hairline(main, 79)
+
+local pagesHolder = make("Frame", { Size = UDim2.new(1, 0, 1, -80), Position = UDim2.fromOffset(0, 80), BackgroundTransparency = 1 }, main)
+
+local pages, tabs, tabIdx = {}, {}, {}
+local function newPage(name, idx)
+    local p = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false }, pagesHolder)
+    pad(p, 16, 14, 16, 10)
+    make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, p)
+    pages[name], tabIdx[name] = p, idx
+
+    local b = make("TextButton", {
+        Size = UDim2.fromOffset(TAB_W, 34), Position = UDim2.fromOffset(16 + (idx - 1) * TAB_W, 0), BackgroundTransparency = 1,
+        Text = name, TextColor3 = C.muted, TextSize = 12, Font = Enum.Font.GothamMedium, BorderSizePixel = 0, AutoButtonColor = false,
+    }, tabStrip)
+    weight(b, Enum.FontWeight.SemiBold)
+    tabs[name] = b
+    return p
+end
+local function showPage(name)
+    for n, p in pairs(pages) do
+        p.Visible = (n == name)
+        tw(tabs[n], { TextColor3 = (n == name) and C.text or C.muted })
+    end
+    tw(tabUnderline, { Position = UDim2.fromOffset(24 + (tabIdx[name] - 1) * TAB_W, 32) }, 0.2)
+end
+
+local farm = newPage("Run", 1)
+local cfg  = newPage("Config", 2)
+for n, b in pairs(tabs) do b.MouseButton1Click:Connect(function() showPage(n) end) end
+
+local function section(parent, order, title)
+    local f = make("Frame", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, LayoutOrder = order }, parent)
+    local l = label(f, title, 10, C.muted, Enum.FontWeight.SemiBold, { Size = UDim2.fromOffset(#title * 7, 14) })
+    local line = make("Frame", { Size = UDim2.new(1, -(#title * 7 + 8), 0, 1), Position = UDim2.new(0, #title * 7 + 8, 0.5, 0), BackgroundColor3 = C.line, BorderSizePixel = 0 }, f)
+    l:GetPropertyChangedSignal("TextBounds"):Connect(function()
+        local w = l.TextBounds.X + 8
+        line.Position = UDim2.new(0, w, 0.5, 0)
+        line.Size = UDim2.new(1, -w, 0, 1)
+    end)
+end
+
+local function smallBtn(parent, txt, w, x)
+    local b = make("TextButton", {
+        Size = UDim2.fromOffset(w, 26), Position = x, BackgroundColor3 = C.surface, Text = txt, TextColor3 = C.text,
+        TextSize = 11, Font = Enum.Font.GothamMedium, BorderSizePixel = 0, AutoButtonColor = false,
+    }, parent)
+    weight(b, Enum.FontWeight.SemiBold)
+    round(b, 6)
+    stroke(b, C.line)
+    b.MouseEnter:Connect(function() tw(b, { BackgroundColor3 = C.raised }) end)
+    b.MouseLeave:Connect(function() tw(b, { BackgroundColor3 = C.surface }) end)
+    return b
+end
+
+-- Slider ----------------------------------------------------------
+local function slider(parent, order, name, min, max, init, hardMax, log, onChange)
+    local row = make("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundTransparency = 1, LayoutOrder = order }, parent)
+    label(row, name, 12, C.text, Enum.FontWeight.Medium, { Size = UDim2.new(0.6, 0, 0, 16) })
+
+    local box = make("TextBox", {
+        Size = UDim2.fromOffset(64, 16), Position = UDim2.new(1, -64, 0, 0), BackgroundTransparency = 1,
+        Text = tostring(init), TextColor3 = C.accent, TextSize = 12, Font = Enum.Font.RobotoMono,
+        TextXAlignment = Enum.TextXAlignment.Right, BorderSizePixel = 0, ClearTextOnFocus = false,
+    }, row)
+
+    local track = make("Frame", { Size = UDim2.new(1, 0, 0, 3), Position = UDim2.fromOffset(0, 28), BackgroundColor3 = C.raised, BorderSizePixel = 0 }, row)
+    local fill = make("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = C.accent, BorderSizePixel = 0 }, track)
+    local knob = make("Frame", {
+        Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = C.text, BorderSizePixel = 0,
+    }, track)
+    round(knob, 3)
+
+    local function toA(v)
+        if log then return (math.log(v) - math.log(min)) / (math.log(max) - math.log(min)) end
+        return (v - min) / (max - min)
+    end
+    local function fromA(a)
+        if log then return math.exp(math.log(min) + a * (math.log(max) - math.log(min))) end
+        return min + a * (max - min)
+    end
+    local function set(v)
+        v = math.clamp(math.floor(v + 0.5), min, hardMax)
+        local a = math.clamp(toA(math.clamp(v, min, max)), 0, 1)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.fromScale(a, 0.5)
+        box.Text = tostring(v)
+        onChange(v)
+    end
+    set(init)
+
+    local hit = make("TextButton", { Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 18), BackgroundTransparency = 1, Text = "" }, row)
+    local dragging = false
+    local function upd(x) set(fromA(math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1))) end
+    hit.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            upd(i.Position.X)
+            i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            upd(i.Position.X)
+        end
+    end)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then set(n) else box.Text = tostring(init) end
+    end)
+end
+
+-- Toggle (flat row) -----------------------------------------------
+local function toggleRow(parent, order, name, init, onChange)
+    local row = make("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, LayoutOrder = order }, parent)
+    label(row, name, 12, C.text, Enum.FontWeight.Medium, { Size = UDim2.new(1, -44, 1, 0) })
+
+    local sw = make("TextButton", {
+        Size = UDim2.fromOffset(32, 18), Position = UDim2.new(1, -32, 0.5, -9), Text = "", BorderSizePixel = 0,
+        AutoButtonColor = false, BackgroundColor3 = init and C.accent or C.raised,
+    }, row)
+    round(sw, 5)
+    local dot = make("Frame", {
+        Size = UDim2.fromOffset(12, 12), Position = init and UDim2.fromOffset(17, 3) or UDim2.fromOffset(3, 3),
+        BackgroundColor3 = init and C.onAccent or C.muted, BorderSizePixel = 0,
+    }, sw)
+    round(dot, 3)
+
+    local on = init
+    sw.MouseButton1Click:Connect(function()
+        on = not on
+        tw(sw, { BackgroundColor3 = on and C.accent or C.raised })
+        tw(dot, { Position = on and UDim2.fromOffset(17, 3) or UDim2.fromOffset(3, 3), BackgroundColor3 = on and C.onAccent or C.muted })
+        onChange(on)
+    end)
+end
+
+-- RUN PAGE --------------------------------------------------------
+local statusBlock = make("Frame", { Size = UDim2.new(1, 0, 0, 50), LayoutOrder = 1, BackgroundTransparency = 1 }, farm)
+local statusDot = make("Frame", { Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(0, 10), BackgroundColor3 = C.muted, BorderSizePixel = 0 }, statusBlock)
+round(statusDot, 4)
+local statusMain = label(statusBlock, "Idle", 21, C.text, Enum.FontWeight.SemiBold, { Size = UDim2.new(1, -18, 0, 28), Position = UDim2.fromOffset(18, 0), TextTruncate = Enum.TextTruncate.AtEnd })
+local statusSub  = label(statusBlock, "ready", 11, C.muted, nil, { Size = UDim2.new(1, -18, 0, 14), Position = UDim2.fromOffset(18, 30), TextTruncate = Enum.TextTruncate.AtEnd, mono = true })
+
+setStatus = function(txt, color, sub)
+    statusMain.Text = txt
+    if sub then statusSub.Text = sub end
+    if color then tw(statusDot, { BackgroundColor3 = color }) end
+end
+
+local runBtn = make("TextButton", {
+    Size = UDim2.new(1, 0, 0, 38), LayoutOrder = 2, BackgroundColor3 = C.accent, Text = "Start",
+    TextColor3 = C.onAccent, TextSize = 13, Font = Enum.Font.GothamBold, BorderSizePixel = 0, AutoButtonColor = false,
+}, farm)
+weight(runBtn, Enum.FontWeight.SemiBold)
+round(runBtn, 6)
+
+section(farm, 3, "HOME")
+
+local homeRow = make("Frame", { Size = UDim2.new(1, 0, 0, 26), LayoutOrder = 4, BackgroundTransparency = 1 }, farm)
+local homeLbl = label(homeRow, "not set", 11, C.muted, nil, { Size = UDim2.new(1, -112, 1, 0), mono = true, TextTruncate = Enum.TextTruncate.AtEnd })
+local setHomeBtn = smallBtn(homeRow, "Set here", 58, UDim2.new(1, -112, 0, 0))
+local goHomeBtn  = smallBtn(homeRow, "Go", 48, UDim2.new(1, -48, 0, 0))
+
+onHomeChanged = function()
+    if home then
+        homeLbl.Text = string.format("%d, %d, %d", home.X, home.Y, home.Z)
+        homeLbl.TextColor3 = C.text
+    else
+        homeLbl.Text = "not set"
+        homeLbl.TextColor3 = C.muted
+    end
+end
+
+toggleRow(farm, 5, "Return home when no candy left", CONFIG.returnHome, function(v) CONFIG.returnHome = v end)
+
+section(farm, 6, "MOVEMENT")
+
+local MODES = {
+    { "Smart",   "Direct when the way is clear, otherwise follows a safe path." },
+    { "Walk",    "Real walking. Slowest, hardest to flag, re-paths if blocked." },
+    { "Tween",   "Glides along the safe path at your speed." },
+    { "Hop",     "Goes over obstacles. Clips, so expect rubber-banding." },
+    { "Instant", "Snaps onto the spot. Fastest, most likely to be flagged." },
+}
+
+local seg = make("Frame", { Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 7, BackgroundColor3 = C.surface, BorderSizePixel = 0 }, farm)
+round(seg, 6)
+stroke(seg, C.line)
+pad(seg, 2, 2, 2, 2)
+local indicator = make("Frame", { Size = UDim2.fromScale(1 / #MODES, 1), BackgroundColor3 = C.raised, BorderSizePixel = 0 }, seg)
+round(indicator, 4)
+
+local desc = label(farm, MODES[1][2], 11, C.muted, Enum.FontWeight.Regular, { Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 8, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top })
+
+local modeBtns = {}
+local function setMode(name)
+    CONFIG.mode = name
+    for i, m in ipairs(MODES) do
+        local on = m[1] == name
+        tw(modeBtns[m[1]], { TextColor3 = on and C.text or C.muted })
+        if on then
+            desc.Text = m[2]
+            tw(indicator, { Position = UDim2.fromScale((i - 1) / #MODES, 0) }, 0.2)
+        end
+    end
+end
+for i, m in ipairs(MODES) do
+    local b = make("TextButton", {
+        Size = UDim2.fromScale(1 / #MODES, 1), Position = UDim2.fromScale((i - 1) / #MODES, 0), BackgroundTransparency = 1,
+        Text = m[1], TextColor3 = C.muted, TextSize = 11, Font = Enum.Font.GothamMedium, BorderSizePixel = 0, AutoButtonColor = false, ZIndex = 2,
+    }, seg)
+    weight(b, Enum.FontWeight.SemiBold)
+    modeBtns[m[1]] = b
+    b.MouseButton1Click:Connect(function() setMode(m[1]) end)
+end
+setMode(CONFIG.mode)
+
+slider(farm, 9, "Speed", 10, 3000, CONFIG.speed, 100000, true, function(v) CONFIG.speed = v end)
+
+-- CONFIG PAGE -----------------------------------------------------
+section(cfg, 1, "TARGETING")
+
+local actRow = make("Frame", { Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 2, BackgroundTransparency = 1 }, cfg)
+label(actRow, "Prompt text", 12, C.text, Enum.FontWeight.Medium, { Size = UDim2.new(0.5, 0, 1, 0) })
+local actBox = make("TextBox", {
+    Size = UDim2.new(0.42, 0, 0, 24), Position = UDim2.new(0.58, 0, 0.5, -12), BackgroundColor3 = C.surface,
+    Text = CONFIG.actionText, TextColor3 = C.accent, TextSize = 12, Font = Enum.Font.RobotoMono,
+    BorderSizePixel = 0, ClearTextOnFocus = false,
+}, actRow)
+round(actBox, 6)
+stroke(actBox, C.line)
+actBox.FocusLost:Connect(function()
+    local s = actBox.Text:match("^%s*(.-)%s*$")
+    if s ~= "" then CONFIG.actionText = s else actBox.Text = CONFIG.actionText end
+end)
+
+slider(cfg, 3, "Click burst", 1, 10, CONFIG.clickBurst, 20, false, function(v) CONFIG.clickBurst = v end)
+toggleRow(cfg, 4, "Verify the door opened", CONFIG.verify, function(v) CONFIG.verify = v end)
+
+section(cfg, 5, "SAFETY")
+
+toggleRow(cfg, 6, "Auto-slow after rubber-band", CONFIG.autoSlow, function(v) CONFIG.autoSlow = v end)
+toggleRow(cfg, 7, "Clip through walls as last resort", CONFIG.allowClip, function(v) CONFIG.allowClip = v end)
+slider(cfg, 8, "Hop ceiling", 10, 400, CONFIG.hopHeight, 2000, false, function(v) CONFIG.hopHeight = v end)
+
+local thrRow = make("Frame", { Size = UDim2.new(1, 0, 0, 16), LayoutOrder = 9, BackgroundTransparency = 1 }, cfg)
+label(thrRow, "Speed throttle", 12, C.text, Enum.FontWeight.Medium, { Size = UDim2.new(0.6, 0, 1, 0) })
+local thrLbl = label(thrRow, "x1.00", 12, C.good, nil, { Size = UDim2.new(0.4, 0, 1, 0), Position = UDim2.fromScale(0.6, 0), TextXAlignment = Enum.TextXAlignment.Right, mono = true })
+onThrottle = function()
+    thrLbl.Text = string.format("x%.2f", throttle)
+    thrLbl.TextColor3 = throttle >= 0.95 and C.good or (throttle >= 0.5 and C.warn or C.bad)
+end
+
+showPage("Run")
+onHomeChanged()
+
+-- Run / stop ------------------------------------------------------
+local function setRunning(on)
+    state.running = on
+    if on then
+        if not home and hrp then home = hrp.Position; onHomeChanged() end
+    else
+        state.manual = false
+    end
+    runBtn.Text = on and "Stop" or "Start"
+    tw(runBtn, { BackgroundColor3 = on and C.raised or C.accent, TextColor3 = on and C.bad or C.onAccent })
+    setStatus(on and "Running" or "Idle", on and C.good or C.muted, on and "searching" or "ready")
+end
+runBtn.MouseButton1Click:Connect(function() setRunning(not state.running) end)
+
+setHomeBtn.MouseButton1Click:Connect(function()
+    if hrp and hrp.Parent then home = hrp.Position; onHomeChanged() end
+end)
+goHomeBtn.MouseButton1Click:Connect(function()
+    if not home or state.busy or not hrp or not hrp.Parent then return end
+    state.busy, state.manual = true, true
+    setStatus("Going home", C.accent, "manual")
+    task.spawn(function()
+        local ok = moveTo({ { pos = home } })
+        state.manual, state.busy = false, false
+        if not state.running then setStatus(ok and "At home" or "Couldn't reach home", ok and C.good or C.warn, "idle") end
+    end)
+end)
+
+-- Window controls
+local function setVisible(v) main.Visible = v; mini.Visible = not v end
+hideBtn.MouseButton1Click:Connect(function() setVisible(false) end)
+mini.MouseButton1Click:Connect(function() setVisible(true) end)
+closeBtn.MouseButton1Click:Connect(function()
+    state.alive, state.running, state.manual = false, false, false
+    setNoclip(false)
+    for _, c in ipairs(conns) do c:Disconnect() end
+    gui:Destroy()
+end)
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
+    if not gp and i.KeyCode == Enum.KeyCode.RightShift then setVisible(not main.Visible) end
+end)
+
+-- Drag via header
+local drag, dragStart, startPos
+header.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        drag, dragStart, startPos = true, i.Position, main.Position
+        i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then drag = false end end)
+    end
+end)
+conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
+    if not drag then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+        local d = i.Position - dragStart
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+
+-- ------------------------------------------------------------
+-- MAIN LOOP
+-- ------------------------------------------------------------
+local function detail(dist)
+    local s = string.format("%s · %.0f studs", rubberStreak >= 3 and "Walk (auto)" or CONFIG.mode, dist)
+    if CONFIG.autoSlow and throttle < 0.95 then s ..= string.format(" · x%.2f", throttle) end
+    return s
+end
+
+local function farmOnce()
+    if not state.running or state.busy or not hrp or not hrp.Parent or humanoid.Health <= 0 then return end
+    state.busy = true
+
+    local all, valid = scan(), {}
+    for _, p in ipairs(all) do
+        if not isCooling(p.pos) then valid[#valid + 1] = p end
+    end
+
+    -- nothing left at all: retreat home (once), then wait
+    if #all == 0 then
+        emptySince = emptySince or now()
+        if CONFIG.returnHome and home and now() - emptySince > 2.5 and (hrp.Position - home).Magnitude > 8 then
+            setStatus("Returning home", C.accent, detail((hrp.Position - home).Magnitude))
+            local ok = moveTo({ { pos = home } })
+            setStatus(ok and "At home" or "Couldn't reach home", ok and C.good or C.warn, "waiting for candy")
+        else
+            local atHome = home and (hrp.Position - home).Magnitude <= 8
+            setStatus(atHome and "At home" or "No candy", atHome and C.good or C.warn, "waiting for candy")
+        end
+        state.busy = false
+        return
+    end
+    emptySince = nil
+
+    if #valid == 0 then
+        setStatus("Cooldown", C.warn, "waiting for respawns")
+        state.busy = false
+        return
+    end
+
+    local origin = hrp.Position
+    local vw = (CONFIG.mode == "Walk") and 1.5 or 0.5
+    local function score(p)
+        local d = p.pos - origin
+        return Vector3.new(d.X, 0, d.Z).Magnitude + math.abs(d.Y) * vw
+    end
+    table.sort(valid, function(a, b) return score(a) < score(b) end)
+
+    local target = valid[1]
+    setStatus("Approaching", C.accent, detail((target.pos - origin).Magnitude))
+
+    local moved, reason = moveTo(approachPoints(target))
+
+    if moved and target.prompt.Parent then
+        setStatus("Opening", C.accent, "")
+        if activate(target) then
+            cool(target.pos, CONFIG.cooldownSuccess)
+            setStatus("Opened", C.good, "")
+        else
+            cool(target.pos, CONFIG.cooldownFail)
+            setStatus("Didn't open", C.warn, "skipping for now")
+        end
+    elseif not moved and state.running then
+        if reason == "rubber" then
+            cool(target.pos, 3)
+            setStatus("Rubber-banded", C.warn, string.format("slowing to x%.2f, re-planning", throttle))
+        else
+            cool(target.pos, CONFIG.cooldownFail)
+            setStatus("Unreachable", C.warn, "skipping for now")
+        end
+    end
+
+    state.busy = false
+end
+
+task.spawn(function()
+    while state.alive do
+        task.wait(0.1)
+        local ok = pcall(farmOnce)
+        if not ok then state.busy = false; setNoclip(false) end
+    end
+end)
